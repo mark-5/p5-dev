@@ -1,0 +1,220 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use English qw( -no_match_vars $GID $UID );
+use Env qw( $DEV_SHELL_PID $EDITOR $HOME $PWD $SHELL $USER );
+use File::Basename qw( basename dirname );
+use File::Path qw( make_path );
+use File::Spec;
+use Getopt::Long qw( GetOptionsFromArray :config require_order );
+use IO::File;
+use Pod::Usage qw( pod2usage );
+
+# ABSTRACT: manage docker development shells
+
+=head1 NAME
+
+dev - manage docker development shells
+
+=head1 SYNOPSIS
+
+    dev COMMAND [ARGUMENTS..]
+
+    dev shell PROFILE
+
+=head1 COMMANDS
+
+=head2 edit PROFILE
+
+Edit the Dockerfile for PROFILE
+
+=head2 list
+
+List all PROFILES
+
+=head2 shell PROFILE [COMMAND..]
+
+Start a shell session for PROFILE
+
+=head2 sudo [COMMAND..]
+
+Reattach to the current session as root
+
+=cut
+
+sub dev_dir {
+    my (@parts) = @_;
+    return File::Spec->catfile($HOME, '.dev', @parts);
+}
+
+sub docker_build {
+    my ($name) = @_;
+    my $file   = dev_dir($name, 'Dockerfile');
+    docker_template($file) unless -f $file;
+
+    my $rc = system(
+        qw( docker build ), dirname($file),
+        '--build-arg' => "UID=$UID",
+        '--build-arg' => "USER=$USER",
+        '--tag'       => "dev/$name",
+        '--file'      => $file,
+    );
+    if ( $rc ) {
+        die "ERROR running docker build\n";
+    }
+
+    return;
+}
+
+sub docker_run {
+    my ($name, @cmd) = @_;
+    my $dir          = dev_dir($name);
+    my $dev          = find_dev();
+    my $docker       = find_docker();
+    @cmd             = ($SHELL, '-l') unless @cmd;
+
+    system(
+        qw( docker run -it --privileged --rm ),
+        '--env'     => "DEV_SHELL_PID=$$",
+        '--env'     => "USER=$USER",
+        '--label'   => "dev.shell.pid=$$",
+        '--user'    => $UID,
+        '--volume'  => "$dir:/home/$USER",
+        '--volume'  => "$PWD:/home/$USER/dev",
+        '--volume'  => "$dev:/usr/local/bin/dev:ro",
+        '--volume'  => "$docker:/usr/local/bin/docker:ro",
+        '--volume'  => '/var/run/docker.sock:/var/run/docker.sock',
+        '--workdir' => "/home/$USER/dev",
+        "dev/$name", @cmd,
+    );
+}
+
+sub docker_template {
+    my ($file) = @_;
+    my $dir    = dirname($file);
+    make_path($dir) unless -d $dir;
+
+    my $fh = IO::File->new($file, 'w');
+    if ( ! $fh ) {
+        die "ERROR could not open $file for writing: $!\n";
+    }
+
+    $fh->print(<<'__END_FILE__');
+FROM ubuntu:18.04
+ARG UID
+ARG USER
+RUN useradd --groups root --no-user-group --uid "$UID" "$USER"
+__END_FILE__
+}
+
+sub editor {
+    my ($file) = @_;
+    my $editor = $EDITOR || 'vim';
+
+    my $rc = system($editor, $file);
+    if ( $rc ) {
+        die "ERROR running `$editor $file`\n";
+    }
+
+    return;
+}
+
+sub find_container {
+    my ($pid) = @_;
+    chomp(my $container = `docker ps -q --filter label=dev.shell.pid=$pid`);
+    return $container;
+}
+
+sub find_dev {
+    return File::Spec->rel2abs(__FILE__);
+}
+
+sub find_docker {
+    chomp(my $file = `which docker`);
+    if ($?) {
+        die "ERROR could not find path for `docker` executable\n";
+    }
+    return $file;
+}
+
+sub cmd_edit {
+    my ($name) = @_;
+    die "USAGE:\n\tdev edit PROFILE\n" unless $name;
+
+    my $file = dev_dir($name, 'Dockerfile');
+    docker_template($file) unless -f $file;
+
+    editor($file);
+    docker_build($name);
+}
+
+sub cmd_help {
+    pod2usage(-verbose => 99);
+}
+
+sub cmd_list {
+    my ($match) = @_;
+    $match    ||= '*';
+
+    for my $file (sort grep -d, glob dev_dir($match)) {
+        my $name = basename($file);
+        print "$name\n";
+    }
+}
+
+sub cmd_shell {
+    my ($name, @cmd) = @_;
+    die "USAGE:\n\tdev shell PROFILE [COMMAND..]\n" unless $name;
+
+    docker_build($name);
+    docker_run($name, @cmd);
+}
+
+sub cmd_sudo {
+    my (@cmd) = @_;
+    @cmd      = ('/bin/sh') unless @cmd;
+    if ( ! $DEV_SHELL_PID ) {
+        die "ERROR dev sudo must be called from a dev shell session\n";
+    }
+
+    my $container = find_container($DEV_SHELL_PID);
+    system(
+        qw( docker exec -it ),
+        '--env'     => "SUDO_GID=$GID",
+        '--env'     => "SUDO_UID=$UID",
+        '--env'     => "SUDO_USER=$USER",
+        '--env'     => "SUDO_COMMAND=@cmd",
+        '--env'     => 'USER=root',
+        '--user'    => '0:0',
+        '--workdir' => $PWD,
+        $container, @cmd,
+    );
+}
+
+sub getopts {
+    my (@argv) = @_;
+    my %opts;
+
+    GetOptionsFromArray(
+        \@argv,
+        \%opts,
+        'help',
+    ) or pod2usage();
+    pod2usage(-verbose => 99) if $opts{help};
+
+    return (\%opts, @argv);
+}
+
+sub main {
+    my ($opts, $cmd, @args) = getopts(@_);
+    pod2usage() unless $cmd;
+
+    if (my $code = __PACKAGE__->can("cmd_$cmd")) {
+        $code->(@args);
+    } else {        
+        pod2usage();
+    }
+
+    return 0;
+}
+exit main(@ARGV) unless caller;
